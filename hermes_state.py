@@ -2495,6 +2495,128 @@ class SessionDB:
             })
         return out
 
+    def render_task_marker_digest_preview(
+        self,
+        session_id: str,
+        marker_limit: int = 20,
+        field_char_limit: int = 500,
+        total_char_limit: int = 4000,
+    ) -> str:
+        """Render a deterministic, bounded preview of safe task markers.
+
+        Read-only: consumes only the safe fields exposed by ``list_task_markers``
+        and never touches transcript rows or raw/private payload columns. Output
+        is newest-first, with per-field and total size caps so the result is
+        safe to log or display.
+        """
+        markers = self.list_task_markers(session_id, limit=marker_limit)
+        if not markers:
+            return ""
+
+        forbidden_terms = (
+            "raw_payload",
+            "transcript",
+            "private_notes",
+            "message",
+            "history",
+            "password",
+            "api_key",
+            "token",
+            "credential",
+            "secret",
+        )
+        unsafe_patterns = (
+            re.compile(r"file://", re.IGNORECASE),
+            re.compile(r"(?:^|[^A-Za-z0-9])/(?:home|root|var|etc|tmp|opt|usr)/"),
+            re.compile(r"(?:^|[^A-Za-z0-9])[A-Za-z]:\\\\(?:Users|Documents and Settings)\\\\", re.IGNORECASE),
+            re.compile(r"(?:^|[^A-Za-z0-9])\\\\\\\\[^\\\s]+\\\\[^\\\s]+"),
+            re.compile(r"(?:^|[^A-Za-z0-9])\\\\(?:Users|home|root)\\\\", re.IGNORECASE),
+            re.compile(
+                r"(?:^|[^A-Za-z0-9])"
+                r"(?:user|sess|session|msg|message|channel|chan|conv|conversation|thread|topic|peer|chat)"
+                r"_[A-Za-z0-9][A-Za-z0-9_-]*",
+                re.IGNORECASE,
+            ),
+            re.compile(r"(?:^|[^A-Za-z0-9])#[A-Za-z][A-Za-z0-9_-]+"),
+            re.compile(r"(?:^|[^A-Za-z0-9])@[A-Za-z][A-Za-z0-9_-]+"),
+            re.compile(r"(?:^|[^A-Za-z0-9])sk-[A-Za-z0-9][A-Za-z0-9_-]{6,}"),
+            re.compile(r"\b[A-Fa-f0-9]{16,}\b"),
+        )
+        marker_type_whitelist = frozenset({
+            "progress", "decision", "todo", "blocker", "handoff", "note",
+        })
+        source_whitelist = frozenset({
+            "operator", "agent", "system", "cli", "user", "supervisor", "kanban",
+        })
+
+        def _has_forbidden(value: str) -> bool:
+            lowered = value.lower()
+            if any(term in lowered for term in forbidden_terms):
+                return True
+            return any(pattern.search(value) for pattern in unsafe_patterns)
+
+        def _trunc(value: str) -> str:
+            if len(value) > field_char_limit:
+                return value[:field_char_limit] + "..."
+            return value
+
+        def _str_field(value: Any) -> Optional[str]:
+            if not isinstance(value, str) or not value:
+                return None
+            if _has_forbidden(value):
+                return None
+            return _trunc(value)
+
+        def _list_field(values: Any) -> Optional[str]:
+            if not isinstance(values, list):
+                return None
+            items = [
+                _trunc(entry)
+                for entry in values
+                if isinstance(entry, str) and entry and not _has_forbidden(entry)
+            ]
+            return "; ".join(items) if items else None
+
+        def _whitelisted(value: Any, whitelist: "frozenset[str]") -> Optional[str]:
+            if not isinstance(value, str) or not value:
+                return None
+            return value if value.lower() in whitelist else None
+
+        blocks: List[str] = []
+        for marker in markers:
+            lines: List[str] = []
+            title = _str_field(marker.get("safe_title"))
+            if title is not None:
+                lines.append(f"title: {title}")
+            marker_type = _whitelisted(marker.get("marker_type"), marker_type_whitelist)
+            if marker_type is not None:
+                lines.append(f"marker_type: {marker_type}")
+            source = _whitelisted(marker.get("source"), source_whitelist)
+            if source is not None:
+                lines.append(f"source: {source}")
+            created_at = marker.get("created_at")
+            if isinstance(created_at, (int, float)):
+                lines.append(f"created_at: {created_at}")
+            summary = _str_field(marker.get("safe_summary"))
+            if summary is not None:
+                lines.append(f"summary: {summary}")
+            progress = _list_field(marker.get("safe_progress"))
+            if progress is not None:
+                lines.append(f"progress: {progress}")
+            next_actions = _list_field(marker.get("safe_next_actions"))
+            if next_actions is not None:
+                lines.append(f"next_actions: {next_actions}")
+            uncertainties = _list_field(marker.get("safe_uncertainties"))
+            if uncertainties is not None:
+                lines.append(f"uncertainties: {uncertainties}")
+            if lines:
+                blocks.append("\n".join(lines))
+
+        preview = "\n\n".join(blocks)
+        if len(preview) > total_char_limit:
+            preview = preview[:total_char_limit]
+        return preview
+
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.
 

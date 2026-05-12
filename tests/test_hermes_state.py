@@ -3128,3 +3128,241 @@ class TestTaskMarkers:
                 marker_type="progress",
                 raw_payload="should not be accepted",  # type: ignore[call-arg]
             )
+
+
+class TestTaskMarkerDigestPreview:
+    """Read-only safe preview rendering on top of task_markers storage.
+
+    The preview helper is deliberately narrow: it may read only the safe marker
+    fields exposed by ``list_task_markers`` and must not touch transcript rows or
+    raw/private payload fields.
+    """
+
+    def test_preview_renders_safe_fields_newest_first(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="progress",
+            safe_title="older title",
+            safe_summary="older summary",
+            safe_progress=["older progress"],
+            safe_next_actions=["older next"],
+            safe_uncertainties=["older uncertainty"],
+            source="agent",
+            created_at=1000.0,
+        )
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="decision",
+            safe_title="newer title",
+            safe_summary="newer summary",
+            safe_progress=["newer progress"],
+            safe_next_actions=["newer next"],
+            safe_uncertainties=["newer uncertainty"],
+            source="operator",
+            created_at=2000.0,
+        )
+
+        preview = db.render_task_marker_digest_preview("s1")
+
+        assert preview.index("newer title") < preview.index("older title")
+        for expected in (
+            "marker_type: decision",
+            "source: operator",
+            "created_at: 2000.0",
+            "summary: newer summary",
+            "progress: newer progress",
+            "next_actions: newer next",
+            "uncertainties: newer uncertainty",
+        ):
+            assert expected in preview
+
+    def test_preview_bounds_marker_count_field_chars_and_total_chars(self, db):
+        db.create_session(session_id="s1", source="cli")
+        for i in range(4):
+            db.add_task_marker(
+                session_id="s1",
+                marker_type="progress",
+                safe_title=f"title-{i}-" + ("x" * 50),
+                safe_summary="summary-" + ("y" * 50),
+                safe_progress=["progress-" + ("z" * 50)],
+                source="agent",
+                created_at=1000.0 + i,
+            )
+
+        preview = db.render_task_marker_digest_preview(
+            "s1",
+            marker_limit=2,
+            field_char_limit=12,
+            total_char_limit=180,
+        )
+
+        assert "title-3-xxxx" in preview
+        assert "title-1-" not in preview
+        assert "..." in preview
+        assert len(preview) <= 180
+
+    def test_preview_empty_markers_returns_empty_string(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.render_task_marker_digest_preview("s1") == ""
+
+    def test_preview_handles_malformed_list_json_safely(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(session_id="s1", marker_type="progress", safe_title="safe")
+        db._conn.execute(
+            """
+            UPDATE task_markers
+            SET safe_progress = ?, safe_next_actions = ?, safe_uncertainties = ?
+            WHERE session_id = ?
+            """,
+            ("not-json", '{"not": "a list"}', "[1, null, true, \"ok\"]", "s1"),
+        )
+        db._conn.commit()
+
+        preview = db.render_task_marker_digest_preview("s1")
+
+        assert "safe" in preview
+        assert "not-json" not in preview
+        assert "not: a list" not in preview
+        assert "ok" in preview
+        assert "True" not in preview
+        assert "None" not in preview
+
+    def test_preview_omits_forbidden_raw_private_names_and_content(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            session_id="s1",
+            role="user",
+            content="raw_payload transcript PRIVATE_SECRET_TOKEN password api_key",
+        )
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="progress",
+            safe_title="safe title",
+            safe_summary="safe summary",
+            safe_progress=["safe progress"],
+            created_at=1000.0,
+        )
+
+        preview = db.render_task_marker_digest_preview("s1")
+
+        assert "safe title" in preview
+        forbidden = (
+            "raw_payload",
+            "transcript",
+            "PRIVATE_SECRET_TOKEN",
+            "password",
+            "api_key",
+            "messages",
+            "history",
+            "private_notes",
+        )
+        assert all(term not in preview for term in forbidden)
+
+    def test_preview_fails_closed_when_safe_fields_contain_forbidden_terms(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="progress",
+            safe_title="safe public title",
+            safe_summary="raw_payload transcript password api_key token",
+            safe_progress=["visible progress", "private_notes should not render"],
+            safe_next_actions=["credential rotation should not render"],
+            safe_uncertainties=["visible uncertainty"],
+            source="agent",
+            created_at=1000.0,
+        )
+
+        preview = db.render_task_marker_digest_preview("s1")
+
+        assert "safe public title" in preview
+        assert "visible progress" in preview
+        assert "visible uncertainty" in preview
+        forbidden = (
+            "raw_payload",
+            "transcript",
+            "password",
+            "api_key",
+            "token",
+            "private_notes",
+            "credential",
+        )
+        assert all(term not in preview.lower() for term in forbidden)
+
+    def test_preview_fails_closed_for_raw_identifier_path_channel_and_token_shapes(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="progress",
+            safe_title="safe public title",
+            safe_summary=(
+                "user_123 sess_abc123 msg_456 channel_789 "
+                "FILE:///home/duckran/x /home/duckran/private "
+                "#hermes-main @operator sk-abc1234567890abcdef"
+            ),
+            safe_progress=[
+                "visible progress",
+                "sess_deadbeef should not render",
+                "FILE:///home/duckran/y should not render",
+                "sk-testabcdef1234567890 should not render",
+                r"C:\\Users\\duckran\\private should not render",
+                r"\\\\server\\share should not render",
+                r"\\Users\\duckran\\private should not render",
+            ],
+            safe_next_actions=[
+                "channel_456 should not render",
+                "visible next action",
+            ],
+            safe_uncertainties=[
+                "user_999 should not render",
+                "visible uncertainty",
+            ],
+            source="msg_456",
+            created_at=1000.0,
+        )
+
+        preview = db.render_task_marker_digest_preview("s1")
+        lowered = preview.lower()
+
+        assert "safe public title" in preview
+        assert "visible progress" in preview
+        assert "visible next action" in preview
+        assert "visible uncertainty" in preview
+        forbidden_fragments = (
+            "user_123",
+            "sess_abc123",
+            "msg_456",
+            "channel_789",
+            "file:///home/duckran/x",
+            "/home/duckran/private",
+            "#hermes-main",
+            "@operator",
+            "sk-abc1234567890abcdef",
+            "sk-testabcdef1234567890",
+            r"c:\\users\\duckran\\private",
+            r"\\\\server\\share",
+            r"\\users\\duckran\\private",
+            "sess_deadbeef",
+            "file:///home/duckran/y",
+            "channel_456",
+            "user_999",
+            "source:",
+        )
+        assert all(fragment not in lowered for fragment in forbidden_fragments)
+
+    def test_preview_allows_only_benign_marker_type_values(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="msg_456",
+            safe_title="safe title",
+            safe_summary="safe summary",
+            created_at=1000.0,
+        )
+
+        preview = db.render_task_marker_digest_preview("s1")
+
+        assert "safe title" in preview
+        assert "safe summary" in preview
+        assert "marker_type: msg_456" not in preview
