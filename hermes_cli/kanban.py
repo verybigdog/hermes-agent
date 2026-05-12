@@ -434,6 +434,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unblock = sub.add_parser("unblock", help="Return one or more blocked tasks to ready")
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_resolve_handoff = sub.add_parser(
+        "resolve-handoff",
+        help="Complete review-required:/handoff-complete: blocked handoffs only",
+    )
+    p_resolve_handoff.add_argument("task_ids", nargs="+")
+    p_resolve_handoff.add_argument(
+        "--summary",
+        default=None,
+        help="Optional completion summary. Only allowed with a single task id.",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="+")
 
@@ -725,6 +736,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "edit":     _cmd_edit,
         "block":    _cmd_block,
         "unblock":  _cmd_unblock,
+        "resolve-handoff": _cmd_resolve_handoff,
         "archive":  _cmd_archive,
         "tail":     _cmd_tail,
         "dispatch": _cmd_dispatch,
@@ -1640,6 +1652,39 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}")
+    return 0 if not failed else 1
+
+
+def _cmd_resolve_handoff(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    summary = getattr(args, "summary", None)
+    if len(ids) > 1 and summary:
+        print(
+            "kanban: --summary is per-task and can't be used with multiple ids",
+            file=sys.stderr,
+        )
+        return 2
+    failed: list[str] = []
+    resolver = _profile_author()
+    with kb.connect() as conn:
+        for tid in ids:
+            if not kb.resolve_handoff_block(
+                conn,
+                tid,
+                resolver=resolver,
+                summary=summary,
+            ):
+                failed.append(tid)
+                print(
+                    f"cannot resolve handoff {tid} "
+                    "(not blocked, unknown, or reason is not review-required:/handoff-complete:)",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"Resolved handoff {tid}")
     return 0 if not failed else 1
 
 

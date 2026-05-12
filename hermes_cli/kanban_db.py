@@ -93,6 +93,7 @@ from toolsets import get_toolset_names
 VALID_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+HANDOFF_BLOCK_PREFIXES = ("review-required:", "handoff-complete:")
 
 # A running task's claim is valid for 15 minutes; after that the next
 # dispatcher tick reclaims it.  Workers that outlive this window should call
@@ -2634,6 +2635,112 @@ def block_task(
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
         return True
+
+
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the latest durable block reason for ``task_id``.
+
+    The task's current blocked state is represented most directly by the latest
+    ``blocked`` event. Prefer that event over task_runs summaries so an older
+    ``review-required:`` run cannot authorize resolution after a newer real
+    blocker (for example ``BLOCK: missing credentials``) was recorded by a
+    legacy/external writer. Fall back to task_runs only when no blocked event
+    with a reason exists.
+    """
+    event = conn.execute(
+        """
+        SELECT payload
+          FROM task_events
+         WHERE task_id = ?
+           AND kind = 'blocked'
+           AND payload IS NOT NULL
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if event and event["payload"]:
+        try:
+            payload = json.loads(event["payload"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if reason:
+            return str(reason)
+        return None
+
+    row = conn.execute(
+        """
+        SELECT summary
+          FROM task_runs
+         WHERE task_id = ?
+           AND outcome = 'blocked'
+           AND summary IS NOT NULL
+         ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if row and row["summary"]:
+        return str(row["summary"])
+    return None
+
+
+def is_handoff_block_reason(reason: Optional[str]) -> bool:
+    """Return True for fail-closed handoff-complete block reasons only."""
+    if not reason:
+        return False
+    normalized = str(reason).lstrip().casefold()
+    return any(normalized.startswith(prefix) for prefix in HANDOFF_BLOCK_PREFIXES)
+
+
+def resolve_handoff_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    resolver: Optional[str] = None,
+    summary: Optional[str] = None,
+) -> bool:
+    """Complete a blocked task only when its reason is a handoff sentinel.
+
+    This is the explicit operator path for implementation tasks that were
+    intentionally blocked as a durable ``review-required:`` or
+    ``handoff-complete:`` handoff. Real blockers (failed tests, missing creds,
+    user input, reviewer BLOCK, etc.) stay blocked because their reason does
+    not match the exact allowlisted prefixes.
+    """
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] != "blocked":
+        return False
+    reason = _latest_block_reason(conn, task_id)
+    if not is_handoff_block_reason(reason):
+        return False
+    resolver_name = (resolver or "operator").strip() or "operator"
+    handoff_summary = summary or f"handoff block resolved by {resolver_name}: {reason}"
+    completed = complete_task(
+        conn,
+        task_id,
+        result=handoff_summary,
+        summary=handoff_summary,
+        metadata={
+            "resolved_block_reason": reason,
+            "resolved_by": resolver_name,
+            "resolver_semantics": "allowed prefixes: review-required:, handoff-complete:",
+        },
+    )
+    if not completed:
+        return False
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "handoff_block_resolved",
+            {"resolver": resolver_name, "reason": reason},
+        )
+    return True
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:

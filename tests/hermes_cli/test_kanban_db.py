@@ -145,6 +145,62 @@ def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_resolve_review_required_block_promotes_review_child(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="builder")
+        child = kb.create_task(conn, title="review", parents=[parent], assignee="reviewer")
+        kb.claim_task(conn, parent, claimer="host:builder")
+        kb.block_task(
+            conn,
+            parent,
+            reason="review-required: implementation ready, tests pass",
+        )
+
+        assert kb.get_task(conn, parent).status == "blocked"
+        assert kb.get_task(conn, child).status == "todo"
+
+        assert kb.resolve_handoff_block(conn, parent, resolver="operator") is True
+
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_resolve_review_required_block_refuses_real_blockers(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="builder")
+        child = kb.create_task(conn, title="review", parents=[parent], assignee="reviewer")
+        kb.claim_task(conn, parent, claimer="host:builder")
+        kb.block_task(conn, parent, reason="BLOCK: tests failing, needs fix")
+
+        assert kb.resolve_handoff_block(conn, parent, resolver="operator") is False
+
+        assert kb.get_task(conn, parent).status == "blocked"
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_resolve_handoff_refuses_newer_real_blocker_after_stale_review_run(kanban_home):
+    """A stale review-required block run must not override the current blocker.
+
+    Legacy/external writers may record the later block as a blocked event without
+    a task_runs row. The resolver must fail closed on the latest durable block
+    event rather than completing from an older review-required run summary.
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation", assignee="builder")
+        child = kb.create_task(conn, title="review", parents=[parent], assignee="reviewer")
+        kb.claim_task(conn, parent, claimer="host:builder")
+        kb.block_task(conn, parent, reason="review-required: old handoff")
+        assert kb.unblock_task(conn, parent)
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (parent,))
+            kb._append_event(conn, parent, "blocked", {"reason": "BLOCK: missing credentials"})
+
+        assert kb.resolve_handoff_block(conn, parent, resolver="operator") is False
+        assert kb.get_task(conn, parent).status == "blocked"
+        assert kb.get_task(conn, child).status == "todo"
+
+
 # ---------------------------------------------------------------------------
 # Atomic claim (CAS)
 # ---------------------------------------------------------------------------

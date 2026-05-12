@@ -111,6 +111,30 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_resolve_handoff_only_allows_review_required(kanban_home):
+    import re
+
+    parent_out = kc.run_slash("create 'impl' --assignee builder")
+    parent = re.search(r"(t_[a-f0-9]+)", parent_out).group(1)
+    child_out = kc.run_slash(f"create 'review' --assignee reviewer --parent {parent}")
+    child = re.search(r"(t_[a-f0-9]+)", child_out).group(1)
+    kc.run_slash(f"claim {parent}")
+    kc.run_slash(f"block {parent} 'review-required: ready for reviewer'")
+
+    assert "Resolved handoff" in kc.run_slash(f"resolve-handoff {parent}")
+    assert "status:    done" in kc.run_slash(f"show {parent}")
+    assert "status:    ready" in kc.run_slash(f"show {child}")
+
+    real_out = kc.run_slash("create 'real blocker' --assignee builder")
+    real = re.search(r"(t_[a-f0-9]+)", real_out).group(1)
+    kc.run_slash(f"claim {real}")
+    kc.run_slash(f"block {real} 'BLOCK: missing credentials'")
+
+    refused = kc.run_slash(f"resolve-handoff {real}")
+    assert "cannot resolve handoff" in refused
+    assert "status:    blocked" in kc.run_slash(f"show {real}")
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)
