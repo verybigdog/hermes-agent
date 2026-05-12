@@ -244,10 +244,27 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- K0.7b: RedactedTaskDigest storage. Stores ONLY safe marker fields suitable
+-- for context injection — never raw transcript payloads or private notes.
+-- The API surface (add_task_marker) accepts only the columns declared here.
+CREATE TABLE IF NOT EXISTS task_markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    marker_type TEXT NOT NULL,
+    safe_title TEXT,
+    safe_summary TEXT,
+    safe_progress TEXT,
+    safe_next_actions TEXT,
+    safe_uncertainties TEXT,
+    source TEXT,
+    created_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_task_markers_session ON task_markers(session_id, created_at DESC);
 """
 
 FTS_SQL = """
@@ -2351,6 +2368,7 @@ class SessionDB:
             )
 
             for sid in session_ids:
+                conn.execute("DELETE FROM task_markers WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
@@ -2383,6 +2401,99 @@ class SessionDB:
                 (key, value),
             )
         self._execute_write(_do)
+
+    # ── RedactedTaskDigest groundwork: task_markers (K0.7b) ──
+    #
+    # The signature is explicit (no **kwargs) so callers cannot smuggle raw
+    # transcript or private payloads into storage. Only the safe marker fields
+    # listed here are persisted; anything else raises TypeError at call time.
+
+    def add_task_marker(
+        self,
+        session_id: str,
+        marker_type: str,
+        safe_title: Optional[str] = None,
+        safe_summary: Optional[str] = None,
+        safe_progress: Optional[List[str]] = None,
+        safe_next_actions: Optional[List[str]] = None,
+        safe_uncertainties: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """Store a single safe task marker row for ``session_id``.
+
+        Lists are persisted as JSON text. ``created_at`` defaults to ``time.time()``.
+        """
+        ts = created_at if created_at is not None else time.time()
+        progress_json = json.dumps(list(safe_progress)) if safe_progress else None
+        next_actions_json = json.dumps(list(safe_next_actions)) if safe_next_actions else None
+        uncertainties_json = json.dumps(list(safe_uncertainties)) if safe_uncertainties else None
+
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO task_markers ("
+                "session_id, marker_type, safe_title, safe_summary, "
+                "safe_progress, safe_next_actions, safe_uncertainties, "
+                "source, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    marker_type,
+                    safe_title,
+                    safe_summary,
+                    progress_json,
+                    next_actions_json,
+                    uncertainties_json,
+                    source,
+                    ts,
+                ),
+            )
+        self._execute_write(_do)
+
+    def list_task_markers(
+        self,
+        session_id: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return task markers for ``session_id``, newest first.
+
+        List columns are decoded back into Python lists; missing list values
+        come back as empty lists so callers can iterate unconditionally.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, session_id, marker_type, safe_title, safe_summary, "
+                "safe_progress, safe_next_actions, safe_uncertainties, "
+                "source, created_at "
+                "FROM task_markers WHERE session_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (session_id, int(limit)),
+            ).fetchall()
+
+        def _decode_list(raw: Any) -> List[str]:
+            if not raw:
+                return []
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError):
+                return []
+            return list(decoded) if isinstance(decoded, list) else []
+
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            out.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "marker_type": row["marker_type"],
+                "safe_title": row["safe_title"],
+                "safe_summary": row["safe_summary"],
+                "safe_progress": _decode_list(row["safe_progress"]),
+                "safe_next_actions": _decode_list(row["safe_next_actions"]),
+                "safe_uncertainties": _decode_list(row["safe_uncertainties"]),
+                "source": row["source"],
+                "created_at": row["created_at"],
+            })
+        return out
 
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.

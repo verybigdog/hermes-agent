@@ -2943,3 +2943,188 @@ class TestFTS5ToolCallMigration:
         finally:
             session_db.close()
 
+
+# =========================================================================
+# RedactedTaskDigest groundwork: task_markers storage (K0.7b)
+# =========================================================================
+
+class TestTaskMarkers:
+    """SessionDB.add_task_marker / list_task_markers store only safe marker
+    fields and never persist raw transcript payloads as digest markers.
+
+    This is the storage-only slice — no gateway/context wiring here.
+    """
+
+    def test_add_and_list_single_marker(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(
+            session_id="s1",
+            marker_type="progress",
+            safe_title="K0.7b storage",
+            safe_summary="add task_markers table",
+            safe_progress=["wrote tests", "wired methods"],
+            safe_next_actions=["wire context injection in K0.7c"],
+            safe_uncertainties=["are list columns stable?"],
+            source="agent",
+        )
+
+        rows = db.list_task_markers("s1")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["session_id"] == "s1"
+        assert row["marker_type"] == "progress"
+        assert row["safe_title"] == "K0.7b storage"
+        assert row["safe_summary"] == "add task_markers table"
+        assert row["safe_progress"] == ["wrote tests", "wired methods"]
+        assert row["safe_next_actions"] == ["wire context injection in K0.7c"]
+        assert row["safe_uncertainties"] == ["are list columns stable?"]
+        assert row["source"] == "agent"
+        assert isinstance(row["created_at"], float)
+        assert row["created_at"] > 0
+
+    def test_list_returns_newest_first(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(
+            session_id="s1", marker_type="progress",
+            safe_title="first", created_at=1000.0,
+        )
+        db.add_task_marker(
+            session_id="s1", marker_type="progress",
+            safe_title="second", created_at=2000.0,
+        )
+        db.add_task_marker(
+            session_id="s1", marker_type="progress",
+            safe_title="third", created_at=3000.0,
+        )
+
+        rows = db.list_task_markers("s1")
+        assert [r["safe_title"] for r in rows] == ["third", "second", "first"]
+
+    def test_list_respects_limit(self, db):
+        db.create_session(session_id="s1", source="cli")
+        for i in range(5):
+            db.add_task_marker(
+                session_id="s1", marker_type="progress",
+                safe_title=f"m{i}", created_at=1000.0 + i,
+            )
+
+        rows = db.list_task_markers("s1", limit=2)
+        assert len(rows) == 2
+        assert [r["safe_title"] for r in rows] == ["m4", "m3"]
+
+    def test_list_scoped_to_session(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        db.add_task_marker(session_id="s1", marker_type="progress", safe_title="s1-a")
+        db.add_task_marker(session_id="s2", marker_type="progress", safe_title="s2-a")
+
+        s1_rows = db.list_task_markers("s1")
+        s2_rows = db.list_task_markers("s2")
+        assert [r["safe_title"] for r in s1_rows] == ["s1-a"]
+        assert [r["safe_title"] for r in s2_rows] == ["s2-a"]
+
+    def test_list_empty_session_returns_empty_list(self, db):
+        db.create_session(session_id="s1", source="cli")
+        assert db.list_task_markers("s1") == []
+
+    def test_add_marker_minimal_only_requires_marker_type(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.add_task_marker(session_id="s1", marker_type="checkpoint")
+
+        rows = db.list_task_markers("s1")
+        assert len(rows) == 1
+        assert rows[0]["marker_type"] == "checkpoint"
+        assert rows[0]["safe_title"] is None
+        assert rows[0]["safe_summary"] is None
+        assert rows[0]["safe_progress"] == []
+        assert rows[0]["safe_next_actions"] == []
+        assert rows[0]["safe_uncertainties"] == []
+        assert rows[0]["source"] is None
+
+    def test_table_creation_is_idempotent_across_reopens(self, tmp_path):
+        """Opening the same db file twice must not error — the migration
+        runs idempotently and existing rows survive."""
+        db_path = tmp_path / "marker_state.db"
+        first = SessionDB(db_path=db_path)
+        try:
+            first.create_session(session_id="s1", source="cli")
+            first.add_task_marker(
+                session_id="s1", marker_type="progress",
+                safe_title="persists",
+            )
+        finally:
+            first.close()
+
+        # Reopen — schema init must not fail and prior row must still be there.
+        second = SessionDB(db_path=db_path)
+        try:
+            rows = second.list_task_markers("s1")
+            assert len(rows) == 1
+            assert rows[0]["safe_title"] == "persists"
+        finally:
+            second.close()
+
+    def test_only_declared_safe_columns_exist(self, db):
+        """Schema must not contain raw/private payload columns. The
+        RedactedTaskDigest principle is that markers carry only safe fields.
+        """
+        cols = {
+            row[1]
+            for row in db._conn.execute('PRAGMA table_info("task_markers")').fetchall()
+        }
+        assert cols, "task_markers table must exist"
+        # Allowed safe columns.
+        allowed = {
+            "id",
+            "session_id",
+            "marker_type",
+            "safe_title",
+            "safe_summary",
+            "safe_progress",
+            "safe_next_actions",
+            "safe_uncertainties",
+            "source",
+            "created_at",
+        }
+        assert cols <= allowed, (
+            f"task_markers contains non-safe columns: {cols - allowed}"
+        )
+        # Forbidden raw/private columns must never appear.
+        forbidden = {
+            "raw_payload", "payload", "private_payload", "private_notes",
+            "transcript", "messages", "history", "secret", "token",
+            "api_key", "password", "credentials",
+        }
+        assert cols.isdisjoint(forbidden), (
+            f"task_markers must not store raw payload columns: "
+            f"{cols & forbidden}"
+        )
+
+    def test_task_markers_cascade_when_session_is_pruned(self, db, tmp_path):
+        """Markers are session-scoped state and must not outlive a pruned
+        transcript/session row."""
+        old_started_at = time.time() - (10 * 86400)
+        db.create_session(session_id="old", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (old_started_at, old_started_at + 1, "old"),
+        )
+        db.add_task_marker(
+            session_id="old",
+            marker_type="progress",
+            safe_title="delete with session",
+        )
+
+        assert db.prune_sessions(older_than_days=1, sessions_dir=tmp_path) == 1
+        assert db.list_task_markers("old") == []
+
+    def test_add_marker_rejects_unknown_private_kwargs(self, db):
+        """The API surface itself must refuse to accept raw transcript
+        payloads even by name — there is no escape hatch on this method."""
+        db.create_session(session_id="s1", source="cli")
+        with pytest.raises(TypeError):
+            db.add_task_marker(
+                session_id="s1",
+                marker_type="progress",
+                raw_payload="should not be accepted",  # type: ignore[call-arg]
+            )
