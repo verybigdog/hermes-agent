@@ -94,6 +94,13 @@ VALID_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "arch
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 HANDOFF_BLOCK_PREFIXES = ("review-required:", "handoff-complete:")
+AUTO_REMEDIATE_TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
+AUTO_REMEDIATE_REVIEW_BLOCK_MARKERS = (
+    "verdict: block",
+    "review block:",
+    "review-block:",
+    "reviewer block:",
+)
 
 # A running task's claim is valid for 15 minutes; after that the next
 # dispatcher tick reclaims it.  Workers that outlive this window should call
@@ -2692,6 +2699,128 @@ def is_handoff_block_reason(reason: Optional[str]) -> bool:
         return False
     normalized = str(reason).lstrip().casefold()
     return any(normalized.startswith(prefix) for prefix in HANDOFF_BLOCK_PREFIXES)
+
+
+def _body_directives(body: Optional[str]) -> dict[str, str]:
+    """Parse simple ``key: value`` directives from a task body.
+
+    This intentionally avoids a YAML dependency and only accepts one-line
+    scalar values. It is used for opt-in control-plane hints such as
+    ``auto_remediate: true`` and ``auto_remediate_assignee: ccsupervisor``.
+    """
+    directives: dict[str, str] = {}
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower().replace("-", "_")
+        value = value.strip()
+        if key and value and re.fullmatch(r"[a-z0-9_]+", key):
+            directives[key] = value
+    return directives
+
+
+def _truthy_directive(value: Optional[str]) -> bool:
+    return (value or "").strip().casefold() in AUTO_REMEDIATE_TRUE_VALUES
+
+
+def is_review_block_reason(reason: Optional[str]) -> bool:
+    """Return True for reviewer BLOCK verdicts eligible for remediation.
+
+    Fail-closed handoff sentinels (``review-required:`` / ``handoff-complete:``)
+    are explicitly excluded; those are operator handoffs, not reviewer findings.
+    Real blockers stay blocked unless the reason carries a review verdict marker.
+    """
+    if not reason or is_handoff_block_reason(reason):
+        return False
+    normalized = str(reason).lstrip().casefold()
+    return any(marker in normalized for marker in AUTO_REMEDIATE_REVIEW_BLOCK_MARKERS)
+
+
+def maybe_create_auto_remediation_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str],
+    source_event_id: Optional[int] = None,
+    created_by: str = "kanban-terminal-supervisor",
+) -> Optional[str]:
+    """Create one opt-in remediation child for a reviewer BLOCK event.
+
+    The mechanism is deliberately conservative:
+    - the blocked task body must opt in with ``auto_remediate: true`` (or
+      ``kanban_auto_remediate: true``),
+    - it must name ``auto_remediate_assignee`` explicitly,
+    - the block reason must look like a reviewer BLOCK verdict, and
+    - idempotency is keyed by task id + block event id so notifier retries do
+      not create duplicates.
+
+    The remediation task is created READY rather than parent-gated by the
+    blocked review task; otherwise it could never run while the reviewer task
+    remains blocked. The body records the source task/event for audit.
+    """
+    task = get_task(conn, task_id)
+    if not task or not is_review_block_reason(reason):
+        return None
+
+    directives = _body_directives(task.body)
+    if not (
+        _truthy_directive(directives.get("auto_remediate"))
+        or _truthy_directive(directives.get("kanban_auto_remediate"))
+    ):
+        return None
+
+    assignee = (
+        directives.get("auto_remediate_assignee")
+        or directives.get("remediation_assignee")
+        or ""
+    ).strip()
+    if not assignee:
+        _append_event(
+            conn,
+            task_id,
+            "auto_remediate_skipped",
+            {"reason": "missing auto_remediate_assignee"},
+        )
+        return None
+
+    event_key = str(source_event_id) if source_event_id is not None else "latest"
+    idempotency_key = f"kanban:auto-remediate:{task_id}:{event_key}"
+    title = f"Fix review BLOCK from {task_id}: {task.title}"[:180]
+    block_summary = (reason or "").strip()
+    if len(block_summary) > 1200:
+        block_summary = block_summary[:1200] + "…"
+    body = (
+        f"Auto-created from review BLOCK on Kanban task {task_id}.\n"
+        f"Source event: {event_key}\n"
+        f"Origin task title: {task.title}\n\n"
+        "Review blocker summary:\n"
+        f"{block_summary}\n\n"
+        "Acceptance criteria:\n"
+        "- Address the review BLOCK findings only; do not broaden scope.\n"
+        "- Preserve fail-closed safety and leave real blockers blocked.\n"
+        "- Report Verdict: GO|BLOCK|NEED_MORE with evidence, blockers, and next action.\n"
+    )
+    child_id = create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        workspace_kind=task.workspace_kind if task.workspace_kind in VALID_WORKSPACE_KINDS else "scratch",
+        workspace_path=task.workspace_path,
+        tenant=task.tenant,
+        priority=max(int(task.priority or 0), 0),
+        idempotency_key=idempotency_key,
+    )
+    _append_event(
+        conn,
+        task_id,
+        "auto_remediate_created",
+        {"child_id": child_id, "source_event_id": source_event_id},
+    )
+    return child_id
 
 
 def resolve_handoff_block(

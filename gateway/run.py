@@ -4295,8 +4295,29 @@ class GatewayRunner:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                reason = f": {str(ev.payload['reason'])[:400]}"
                             msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            raw_reason = (
+                                str(ev.payload.get("reason"))
+                                if ev.payload and ev.payload.get("reason")
+                                else ""
+                            )
+                            try:
+                                auto_child_id = await asyncio.to_thread(
+                                    self._kanban_maybe_auto_remediate,
+                                    sub["task_id"],
+                                    raw_reason,
+                                    ev.id,
+                                    board_slug,
+                                )
+                            except Exception as exc:
+                                auto_child_id = None
+                                logger.warning(
+                                    "kanban notifier: auto-remediate check failed for %s on board %s: %s",
+                                    sub["task_id"], board_slug, exc,
+                                )
+                            if auto_child_id:
+                                msg += f"\n↳ auto-remediation queued: {auto_child_id}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -4411,6 +4432,34 @@ class GatewayRunner:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_maybe_auto_remediate(
+        self,
+        task_id: str,
+        reason: str,
+        source_event_id: Optional[int],
+        board: Optional[str] = None,
+    ) -> Optional[str]:
+        """Sync helper: opt-in reviewer BLOCK → one remediation task.
+
+        Runs from the notifier watcher thread path so review BLOCK terminal
+        events can close the loop without a bespoke cron/operator script. The
+        DB helper is fail-closed: no explicit task-body opt-in and assignee
+        allowlist means no child is created.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.maybe_create_auto_remediation_task(
+                conn,
+                task_id,
+                reason=reason,
+                source_event_id=source_event_id,
+                created_by="kanban-notifier",
             )
         finally:
             conn.close()

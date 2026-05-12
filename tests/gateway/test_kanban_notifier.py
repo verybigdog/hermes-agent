@@ -234,3 +234,99 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+def _child_tasks_created_by(created_by):
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE created_by = ? ORDER BY created_at, id",
+            (created_by,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_auto_remediates_opt_in_review_block_once(tmp_path, monkeypatch):
+    db_path = tmp_path / "auto-remediate-review-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="review target",
+            body="auto_remediate: true\nauto_remediate_assignee: ccsupervisor\n",
+            assignee="ccreviewer",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        reason = "Verdict: BLOCK\nEvidence: fixture still exposes unsafe action"
+        assert kb.block_task(conn, tid, reason=reason)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "Verdict: BLOCK" in adapter.sent[0]["text"]
+    assert "auto-remediation queued" in adapter.sent[0]["text"]
+    children = _child_tasks_created_by("kanban-notifier")
+    assert len(children) == 1
+    assert children[0]["assignee"] == "ccsupervisor"
+    assert children[0]["status"] == "ready"
+    assert "fixture still exposes unsafe action" in children[0]["body"]
+
+    conn = kb.connect()
+    try:
+        blocked_events = [ev for ev in kb.list_events(conn, tid) if ev.kind == "blocked"]
+        assert len(blocked_events) == 1
+        duplicate = kb.maybe_create_auto_remediation_task(
+            conn,
+            tid,
+            reason=reason,
+            source_event_id=blocked_events[0].id,
+            created_by="kanban-notifier",
+        )
+    finally:
+        conn.close()
+    assert duplicate == children[0]["id"]
+    assert len(_child_tasks_created_by("kanban-notifier")) == 1
+
+
+def test_kanban_notifier_auto_remediate_ignores_go_and_real_blockers(tmp_path, monkeypatch):
+    db_path = tmp_path / "auto-remediate-ignore.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        go_tid = kb.create_task(
+            conn,
+            title="go target",
+            body="auto_remediate: true\nauto_remediate_assignee: ccsupervisor\n",
+            assignee="ccreviewer",
+        )
+        real_block_tid = kb.create_task(
+            conn,
+            title="real blocker target",
+            body="auto_remediate: true\nauto_remediate_assignee: ccsupervisor\n",
+            assignee="ccreviewer",
+        )
+        kb.add_notify_sub(conn, task_id=go_tid, platform="telegram", chat_id="chat-1")
+        kb.add_notify_sub(conn, task_id=real_block_tid, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(conn, go_tid, summary="Verdict: GO")
+        assert kb.block_task(conn, real_block_tid, reason="BLOCK: missing credentials")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert any("done" in sent["text"] for sent in adapter.sent)
+    assert any("missing credentials" in sent["text"] for sent in adapter.sent)
+    assert _child_tasks_created_by("kanban-notifier") == []
