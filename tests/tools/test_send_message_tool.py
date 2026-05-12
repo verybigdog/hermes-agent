@@ -215,6 +215,106 @@ class TestSendMessageTool:
             user_id="user-123",
         )
 
+    def test_trigger_agent_skips_passive_mirror_and_injects_internal_event(self):
+        config, _telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("tools.send_message_tool._trigger_gateway_agent", new=AsyncMock(return_value={"triggered_agent": True})) as trigger_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345:99",
+                        "message": "please handle this",
+                        "trigger_agent": True,
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["triggered_agent"] is True
+        mirror_mock.assert_not_called()
+        trigger_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            "telegram",
+            "12345",
+            "please handle this",
+            thread_id="99",
+        )
+
+    def test_trigger_agent_discord_thread_matches_real_inbound_session_key(self):
+        """Synthetic handoff for a Discord thread must produce the same
+        session key as a real inbound thread event — otherwise the agent
+        wakes in a sibling session that never sees user replies."""
+        from gateway.session import SessionSource, build_session_key
+        from tools.send_message_tool import _trigger_gateway_agent
+
+        parent_id = "1111111111"
+        thread_id = "2222222222"
+
+        guild = SimpleNamespace(id=987654321)
+        thread_channel = SimpleNamespace(
+            id=int(thread_id),
+            name="design-thread",
+            topic=None,
+            guild=guild,
+            parent_id=int(parent_id),
+        )
+        client = MagicMock()
+        client.get_channel = MagicMock(return_value=thread_channel)
+
+        captured = {}
+
+        async def _fake_handle(event):
+            captured["source"] = event.source
+
+        adapter = SimpleNamespace(
+            _client=client,
+            _resolve_channel_skills=lambda *_args, **_kw: None,
+            _resolve_channel_prompt=lambda *_args, **_kw: None,
+            handle_message=_fake_handle,
+        )
+
+        async def _drive():
+            real_loop = asyncio.get_running_loop()
+            runner = SimpleNamespace(
+                adapters={Platform.DISCORD: adapter},
+                _gateway_loop=real_loop,
+            )
+            with patch("gateway.run._gateway_runner_ref", return_value=runner):
+                return await _trigger_gateway_agent(
+                    Platform.DISCORD,
+                    "discord",
+                    parent_id,
+                    "hello thread",
+                    thread_id=thread_id,
+                )
+
+        result = asyncio.run(_drive())
+        assert result == {"triggered_agent": True}
+
+        synth_source = captured["source"]
+        assert synth_source.chat_id == thread_id
+        assert synth_source.thread_id == thread_id
+        assert synth_source.parent_chat_id == parent_id
+        assert synth_source.chat_type == "thread"
+
+        real_source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=thread_id,
+            chat_name="design-thread",
+            chat_type="thread",
+            user_id="987654",
+            user_name="someone",
+            thread_id=thread_id,
+            parent_chat_id=parent_id,
+        )
+        assert build_session_key(synth_source) == build_session_key(real_source)
+
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()
         leaked = "very-secret-query-token-123456"

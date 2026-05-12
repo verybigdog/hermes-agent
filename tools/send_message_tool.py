@@ -138,6 +138,10 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+            },
+            "trigger_agent": {
+                "type": "boolean",
+                "description": "Opt-in handoff mode. When true, successful delivery is injected as an internal inbound gateway event for the target session so the destination agent wakes/responds. Default false preserves passive notification behavior."
             }
         },
         "required": []
@@ -168,6 +172,7 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    trigger_agent = bool(args.get("trigger_agent", False))
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -289,8 +294,29 @@ def _handle_send(args):
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
+        # Passive notifications are mirrored for continuity. Explicit handoffs
+        # are instead injected as synthetic inbound events so the destination
+        # gateway session actually wakes; mirroring those as assistant/passive
+        # records would leave the target agent idle and can duplicate context.
+        if isinstance(result, dict) and result.get("success") and trigger_agent and mirror_text:
+            try:
+                trigger_result = _run_async(
+                    _trigger_gateway_agent(
+                        platform,
+                        platform_name,
+                        chat_id,
+                        mirror_text,
+                        thread_id=thread_id,
+                    )
+                )
+                if isinstance(trigger_result, dict):
+                    result.update(trigger_result)
+            except Exception as exc:
+                result["triggered_agent"] = False
+                result["trigger_error"] = _sanitize_error_text(str(exc))
+
         # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success") and mirror_text:
+        if isinstance(result, dict) and result.get("success") and mirror_text and not trigger_agent:
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
@@ -313,6 +339,122 @@ def _handle_send(args):
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
+
+
+async def _trigger_gateway_agent(platform, platform_name: str, chat_id: str, message: str, *, thread_id: str | None = None) -> dict:
+    """Inject a delivered cross-channel handoff as an internal inbound event.
+
+    This is deliberately opt-in.  It does *not* make Discord/Telegram process
+    bot/self-authored messages globally, which would risk self-trigger loops;
+    callers must request handoff semantics with ``trigger_agent=True``.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+    if runner is None:
+        return {"triggered_agent": False, "trigger_error": "gateway runner unavailable"}
+
+    try:
+        adapter = runner.adapters.get(platform)
+    except Exception:
+        adapter = None
+    if adapter is None:
+        return {"triggered_agent": False, "trigger_error": f"adapter unavailable for {platform_name}"}
+
+    loop = getattr(runner, "_gateway_loop", None) or getattr(runner, "_loop", None)
+    if loop is None or not getattr(loop, "is_running", lambda: False)():
+        return {"triggered_agent": False, "trigger_error": "gateway event loop unavailable"}
+
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    chat_name = None
+    chat_type = "group"
+    chat_topic = None
+    guild_id = None
+    parent_chat_id = None
+    auto_skill = None
+    channel_prompt = None
+
+    if platform_name == "discord":
+        try:
+            client = getattr(adapter, "_client", None) or getattr(adapter, "client", None)
+            if thread_id:
+                # Real Discord thread inbound events set chat_id == thread_id
+                # and parent_chat_id == parent channel.  Mirror that shape so
+                # build_session_key() produces the same key for a synthesized
+                # handoff and a real thread message — otherwise the handoff
+                # wakes a sibling session that never sees user replies.
+                parent_chat_id = str(chat_id)
+                thread_channel = None
+                if client is not None and str(thread_id).isdigit():
+                    thread_channel = client.get_channel(int(thread_id))
+                if thread_channel is not None:
+                    chat_name = getattr(thread_channel, "name", None)
+                    chat_topic = getattr(thread_channel, "topic", None) or chat_topic
+                    guild = getattr(thread_channel, "guild", None)
+                    guild_id = str(getattr(guild, "id", "") or "") or None
+                    parent_attr = getattr(thread_channel, "parent_id", None)
+                    if parent_attr:
+                        parent_chat_id = str(parent_attr)
+                chat_id = str(thread_id)
+                chat_type = "thread"
+            else:
+                channel = client.get_channel(int(chat_id)) if client is not None and str(chat_id).isdigit() else None
+                if channel is not None:
+                    chat_name = getattr(channel, "name", None)
+                    chat_topic = getattr(channel, "topic", None)
+                    guild = getattr(channel, "guild", None)
+                    guild_id = str(getattr(guild, "id", "") or "") or None
+                    parent_id = getattr(channel, "parent_id", None)
+                    parent_chat_id = str(parent_id) if parent_id else None
+                    chat_type = "thread" if parent_chat_id else "channel"
+            resolver = getattr(adapter, "_resolve_channel_skills", None)
+            if callable(resolver):
+                auto_skill = resolver(str(chat_id), parent_chat_id)
+            prompt_resolver = getattr(adapter, "_resolve_channel_prompt", None)
+            if callable(prompt_resolver):
+                channel_prompt = prompt_resolver(str(chat_id), parent_chat_id)
+        except Exception:
+            logger.debug("Failed to enrich Discord internal handoff metadata", exc_info=True)
+
+    source = SessionSource(
+        platform=platform,
+        chat_id=str(chat_id),
+        chat_name=chat_name,
+        chat_type=chat_type,
+        user_id="internal-handoff",
+        user_name="Hermes handoff",
+        thread_id=thread_id,
+        chat_topic=chat_topic,
+        is_bot=False,
+        guild_id=guild_id,
+        parent_chat_id=parent_chat_id,
+    )
+    event = MessageEvent(
+        text=message,
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+        auto_skill=auto_skill,
+        channel_prompt=channel_prompt,
+    )
+
+    async def _handle():
+        await adapter.handle_message(event)
+
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is loop:
+        await _handle()
+    else:
+        future = asyncio.run_coroutine_threadsafe(_handle(), loop)
+        await asyncio.wrap_future(future)
+    return {"triggered_agent": True}
 
 
 def _parse_target_ref(platform_name: str, target_ref: str):
