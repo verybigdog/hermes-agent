@@ -901,6 +901,15 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
 
+def test_kanban_guidance_prevents_duplicate_review_children():
+    """Worker guidance must tell implementers to reuse existing review children."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "existing review child" in KANBAN_GUIDANCE
+    assert "do not create another review card" in KANBAN_GUIDANCE
+    assert "main operator/watchdog relays" in KANBAN_GUIDANCE
+
+
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     """Sanity: the guidance block is under 4 KB so it doesn't blow
     up the cached prompt."""

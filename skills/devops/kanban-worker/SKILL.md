@@ -70,6 +70,8 @@ kanban_block(
 
 Use `kanban_complete` only when the task is genuinely terminal — e.g. a one-line typo fix, a docs change with no functional consequences, or a research task where the artifact IS the writeup itself.
 
+**Pre-created review child rule:** Before creating a review/QA child, inspect `kanban_show()` for already-linked children. If an existing review child / pre-created review child is present, do **not** create another review card. Put the durable handoff facts on the parent (comment/metadata with changed files, tests, diff path, risks), then complete or `review-required:` block the parent as appropriate so the existing child can run. Workers write durable board state; the main operator/watchdog relays `GO`/`BLOCK`/`NEED_MORE` to the `Origin:` / `return_to:` channel.
+
 **Research task:**
 ```python
 kanban_complete(
