@@ -8998,6 +8998,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # -----------------------------------------------------------------
+        # ContextOps one-turn hydration canary (default OFF, fail-closed).
+        # Appends a metadata-only ContextOps block via the reviewed M4/M5
+        # preview contracts, only for the single allowlisted channel in
+        # contextops.gateway_hydration. The current prepared inbound message is
+        # supplied only to the temporary M4 fixture so ContextOps can leak-scan
+        # the real turn; it is never rendered into context. Any failure leaves
+        # context_prompt untouched — never a visible error in model context.
+        # -----------------------------------------------------------------
+        try:
+            from gateway.contextops_hook import maybe_append_contextops_context
+            context_prompt = maybe_append_contextops_context(
+                context_prompt,
+                _load_gateway_config(),
+                platform=source.platform.value if source.platform else "",
+                chat_id=str(source.chat_id or ""),
+                message_text=message_text,
+            )
+        except Exception:
+            pass
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.

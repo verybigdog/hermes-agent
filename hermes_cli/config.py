@@ -2650,6 +2650,37 @@ DEFAULT_CONFIG = {
     "paste_collapse_threshold_fallback": 5,
     "paste_collapse_char_threshold": 2000,
 
+    # ContextOps integration (experimental, default OFF).
+    #
+    # gateway_hydration drives the one-turn answer-path hydration canary in
+    # gateway/contextops_hook.py. It only activates when `enabled` is the
+    # literal boolean true AND `allowed_channels` contains exactly one
+    # channel entry ("<chat_id>" or "<platform>:<chat_id>"). Every other
+    # field pins the reviewed ContextOps M3/M4/M5 preview artifacts; if any
+    # is missing or stale the hook fails closed to no injection. Defaults
+    # are inert: nothing is imported, read, or injected.
+    "contextops": {
+        "gateway_hydration": {
+            "enabled": False,
+            "allowed_channels": [],
+            # Optional ContextOps repo checkout inserted into sys.path just
+            # for the lazy import (never persisted, never vendored).
+            "repo_path": "",
+            "lane": "",
+            "m3_preview_path": "",
+            "m3_receipt_path": "",
+            "expected_sidecar_hash": "",
+            "expected_effect_id": "",
+            "approval_token": "",
+            "approver": "",
+            "reason": "",
+            "target_id": "",
+            # Optional canary verbosity. "semantic" renders safe
+            # restore_redacted/avoid_redacted labels from the pinned M3 preview;
+            # any unsafe line fails closed to the older count-only placeholders.
+            "detail_level": "counts",
+        },
+    },
 
     # Config schema version - bump this when adding new required fields
     "_config_version": 30,
