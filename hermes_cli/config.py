@@ -2654,8 +2654,9 @@ DEFAULT_CONFIG = {
     #
     # gateway_hydration drives the one-turn answer-path hydration canary in
     # gateway/contextops_hook.py. It only activates when `enabled` is the
-    # literal boolean true AND `allowed_channels` contains exactly one
-    # channel entry ("<chat_id>" or "<platform>:<chat_id>"). Every other
+    # literal boolean true AND `allowed_channels` contains at least one
+    # exact channel entry ("<chat_id>" or "<platform>:<chat_id>") or an
+    # explicit platform wildcard such as "discord:*". Every other
     # field pins the reviewed ContextOps M3/M4/M5 preview artifacts; if any
     # is missing or stale the hook fails closed to no injection. Defaults
     # are inert: nothing is imported, read, or injected.

@@ -9,9 +9,11 @@ Safety posture (all fail-closed to "no injection"):
 
 * Default OFF — requires ``contextops.gateway_hydration.enabled`` to be the
   literal boolean ``True``.
-* Canary scope is exactly one allowlisted channel; the allowlist must contain
-  exactly one entry and the inbound channel must match it. The lane comes
-  from config only, never inferred from message text.
+* Config-gated channel scope: exact channel entries (``<chat_id>`` or
+  ``<platform>:<chat_id>``) and explicit platform wildcards such as
+  ``discord:*`` are supported for reviewed dogfood expansion. Missing/empty
+  chat ids still fail closed. The lane comes from config only, never inferred
+  from message text.
 * ContextOps is imported lazily, only after the config/channel gates pass.
   An optional ``repo_path`` is inserted into ``sys.path`` just for the import
   (nothing persisted, nothing vendored). Import failure → no injection.
@@ -89,15 +91,23 @@ def _channel_allowed(cfg: dict, *, platform: str, chat_id: str) -> bool:
     if cfg.get("enabled") is not True:
         return False
     allowed = cfg.get("allowed_channels")
-    # Canary scope: exactly one configured channel, exact-match only.
-    if not isinstance(allowed, list) or len(allowed) != 1:
+    if not isinstance(allowed, list) or not allowed:
         return False
-    entry = allowed[0]
-    if not isinstance(entry, str) or not entry.strip():
+    clean_platform = str(platform or "").strip()
+    clean_chat_id = str(chat_id or "").strip()
+    if not clean_platform or not clean_chat_id:
         return False
-    if not chat_id:
-        return False
-    return entry == chat_id or entry == f"{platform}:{chat_id}"
+    exact = {clean_chat_id, f"{clean_platform}:{clean_chat_id}"}
+    wildcard = f"{clean_platform}:*"
+    for entry in allowed:
+        if not isinstance(entry, str):
+            continue
+        item = entry.strip()
+        if not item:
+            continue
+        if item in exact or item == wildcard:
+            return True
+    return False
 
 
 def _import_contextops(repo_path: str):

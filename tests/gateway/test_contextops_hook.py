@@ -180,13 +180,23 @@ class TestChannelGate:
             config, platform=PLATFORM, chat_id=CHAT_ID) is None
         assert calls["m4"] == []
 
-    def test_multi_channel_allowlist_fails_closed(self, monkeypatch):
-        """Canary scope is one channel: more than one entry fails closed."""
+    def test_multi_channel_allowlist_exact_matches_one_entry(self, monkeypatch):
+        """Expanded dogfood can allow multiple exact channels without body inference."""
         calls = install_fake_contextops(monkeypatch)
-        config = enabled_config(allowed_channels=[CHANNEL, "discord:222"])
+        config = enabled_config(allowed_channels=["discord:222", CHANNEL])
+        block = build_contextops_injection(
+            config, platform=PLATFORM, chat_id=CHAT_ID)
+        assert block is not None
+        assert len(calls["m4"]) == 1
+
+    def test_platform_wildcard_allows_same_platform_only(self, monkeypatch):
+        calls = install_fake_contextops(monkeypatch)
+        config = enabled_config(allowed_channels=["discord:*"])
         assert build_contextops_injection(
-            config, platform=PLATFORM, chat_id=CHAT_ID) is None
-        assert calls["m4"] == []
+            config, platform=PLATFORM, chat_id=CHAT_ID) is not None
+        assert build_contextops_injection(
+            config, platform="telegram", chat_id=CHAT_ID) is None
+        assert len(calls["m4"]) == 1
 
     def test_allowlist_must_be_list(self, monkeypatch):
         calls = install_fake_contextops(monkeypatch)
